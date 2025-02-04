@@ -1,0 +1,130 @@
+from langchain_community.document_loaders import PyPDFDirectoryLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.schema.document import Document
+from langchain_chroma import Chroma
+from langchain_ollama import OllamaEmbeddings
+from langchain.prompts import ChatPromptTemplate
+from langchain_ollama import OllamaLLM
+import os, shutil, sys, httpx, subprocess, time
+
+script_directory = os.path.dirname(sys.argv[0])
+CHROMA_PATH = os.path.join(script_directory, "chroma")
+DATA_PATH = os.path.join(script_directory, "data")
+llm = OllamaLLM(model='llama3.2')
+
+RAG_TEMPLATE = '''
+Fully answer the question based ONLY on the following context:
+{context}
+
+Question: {question}
+'''
+
+def load_docs():
+    doc_loader = PyPDFDirectoryLoader(DATA_PATH)
+    return doc_loader.load()
+
+def split_docs(docs: list[Document]):
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size = 1200,
+        chunk_overlap = 200,
+        length_function = len,
+        is_separator_regex= False
+    )
+    return text_splitter.split_documents(docs)
+
+def get_embedding_func():
+    embeddings = OllamaEmbeddings(model='nomic-embed-text')
+    return embeddings
+
+def vector_db(chunks: list[Document]):
+    db = Chroma(
+        persist_directory=CHROMA_PATH, 
+        embedding_function=get_embedding_func(),
+        collection_name="RAG"
+    )
+
+    chunks_with_ids = calc_chunk_id(chunks)
+
+    existing_items = db.get(include=[])
+    existing_ids = set(existing_items.get('ids', []))
+    print(f'Number of existing docs: {len(existing_ids)}')
+
+    new_chunks = [chunk for chunk in chunks_with_ids if chunk.metadata['id'] not in existing_ids]
+
+    if new_chunks:
+        print(f'Adding {len(new_chunks)} new docs.')
+        new_chunk_ids = [chunk.metadata['id'] for chunk in new_chunks]
+        db.add_documents(new_chunks, ids=new_chunk_ids)
+    else:
+        print('No new docs to add.') 
+
+    return db.as_retriever()
+
+def calc_chunk_id(chunks: list[Document]):
+    for chunk in chunks:
+        source = chunk.metadata.get('source', 'unknown')
+        page = chunk.metadata.get('page', 0)
+        chunk.metadata['id'] = f'{source}:{page}:{chunks.index(chunk)}'
+    return chunks
+
+def clear_db():
+    if os.path.exists(CHROMA_PATH):
+        shutil.rmtree(CHROMA_PATH)
+
+def parse():
+    reset = input("To reset database, type reset, else press enter: ").strip().lower() == 'reset'
+    if reset:
+        print('Emptying db')
+        clear_db()
+
+def user_query():
+    u_question = input('> ').lower()
+    return u_question
+
+def answer(chain, retriever):
+
+    try:
+        while True:
+            u_question = user_query()
+            if u_question == "exit":
+                exit()
+            else:
+                retrieved_docs = retriever.invoke(u_question)
+                metadata = [{"Source":os.path.basename(doc.metadata.get("source", "")), "Page":doc.metadata.get("page")} for doc in retrieved_docs]
+                response = chain.invoke(u_question)
+                print(f'\nAnswer: {response}\n\nMetadata: {metadata}\n')
+                answer(chain, retriever)
+
+    except KeyboardInterrupt:
+        print('Exiting...')
+        exit()
+        
+    except httpx.ConnectError:
+        print("[Error] LLM is not running. Starting it now...")
+        subprocess.Popen(
+                            ["ollama", "list"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+        time.sleep(3)
+        answer(chain, retriever)
+
+def main():
+    parse()    
+    docs = load_docs()
+    chunks = split_docs(docs)
+    retriever = vector_db(chunks)
+
+    prompt = ChatPromptTemplate.from_template(RAG_TEMPLATE)
+
+    chain = (
+        {"context": retriever, "question": lambda question: question}
+        | prompt
+        | llm
+    )
+
+    answer(chain, retriever)
+      
+
+if __name__ == '__main__':
+    main()
